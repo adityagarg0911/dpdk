@@ -2355,7 +2355,8 @@ out:
 	DRV_LOG(INFO, "device %s priv %p dev port %d at port %u",
 		name, priv, priv->dev_port, eth_dev->data->port_id);
 
-	rte_eth_dev_probing_finish(eth_dev);
+	if (!is_reset)
+		rte_eth_dev_probing_finish(eth_dev);
 
 	return 0;
 
