@@ -1927,9 +1927,6 @@ mana_intr_uninstall(struct mana_priv *priv)
 	int ret;
 	struct rte_eth_dev *dev;
 
-	if (!priv->intr_handle)
-		return 0;
-
 	/* Unregister PCI device removal event callback.
 	 * Do not retry on -EAGAIN to avoid deadlock: the callback
 	 * may be blocked waiting for reset_ops_lock which we hold.
@@ -1942,6 +1939,9 @@ mana_intr_uninstall(struct mana_priv *priv)
 			DRV_LOG(WARNING, "Failed to unregister PCI remove cb ret %d",
 				ret);
 	}
+
+	if (priv->intr_handle == NULL)
+		return 0;
 
 	ret = rte_intr_callback_unregister(priv->intr_handle,
 					   mana_intr_handler, priv);
@@ -2006,16 +2006,6 @@ mana_intr_install(struct rte_eth_dev *eth_dev, struct mana_priv *priv)
 		rte_intr_fd_set(priv->intr_handle, -1);
 		goto free_intr;
 	}
-
-	/* Register for PCI device removal events to distinguish
-	 * PCI hot-remove from service reset. This requires the
-	 * application to call rte_dev_event_monitor_start() for
-	 * events to be delivered (e.g. testpmd --hot-plug-handling).
-	 */
-	ret = rte_dev_event_callback_register(eth_dev->device->name,
-					      mana_pci_remove_event_cb, priv);
-	if (ret)
-		DRV_LOG(WARNING, "Failed to register PCI remove event callback");
 
 	eth_dev->intr_handle = priv->intr_handle;
 	return 0;
@@ -2365,8 +2355,15 @@ out:
 	DRV_LOG(INFO, "device %s priv %p dev port %d at port %u",
 		name, priv, priv->dev_port, eth_dev->data->port_id);
 
-	if (!is_reset)
+	if (!is_reset) {
+		/* The PCI callback persists when the verbs context is replaced. */
+		ret = rte_dev_event_callback_register(eth_dev->device->name,
+						      mana_pci_remove_event_cb, priv);
+		if (ret != 0)
+			DRV_LOG(WARNING, "Failed to register PCI remove event callback: %d",
+				ret);
 		rte_eth_dev_probing_finish(eth_dev);
+	}
 
 	return 0;
 

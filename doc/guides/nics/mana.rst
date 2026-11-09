@@ -104,6 +104,7 @@ Teardown and exit phase
    Vports that were stopped before recovery remain stopped.
    Secondary-process doorbell mappings are removed and restored
    separately for each affected vport.
+   Synchronous control requests are serialized within each process.
    If recovery fails, packet bursts remain blocked.
 
 The driver emits the following ethdev recovery events

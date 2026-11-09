@@ -15,12 +15,11 @@ mana_stop_tx_queues(struct rte_eth_dev *dev)
 	struct mana_priv *priv = dev->data->dev_private;
 	int i, ret;
 
-	for (i = 0; i < priv->num_queues; i++)
-		if (dev->data->tx_queue_state[i] == RTE_ETH_QUEUE_STATE_STOPPED)
-			return 0;
-
 	for (i = 0; i < priv->num_queues; i++) {
 		struct mana_txq *txq = dev->data->tx_queues[i];
+
+		if (txq == NULL)
+			continue;
 
 		if (txq->qp) {
 			ret = ibv_destroy_qp(txq->qp);
