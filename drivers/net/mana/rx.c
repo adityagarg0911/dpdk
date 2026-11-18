@@ -175,10 +175,6 @@ mana_stop_rx_queues(struct rte_eth_dev *dev)
 	struct mana_priv *priv = dev->data->dev_private;
 	int ret, i;
 
-	for (i = 0; i < priv->num_queues; i++)
-		if (dev->data->rx_queue_state[i] == RTE_ETH_QUEUE_STATE_STOPPED)
-			return 0;
-
 	if (priv->rwq_qp) {
 		ret = ibv_destroy_qp(priv->rwq_qp);
 		if (ret)
@@ -196,6 +192,9 @@ mana_stop_rx_queues(struct rte_eth_dev *dev)
 	for (i = 0; i < priv->num_queues; i++) {
 		struct mana_rxq *rxq = dev->data->rx_queues[i];
 
+		if (rxq == NULL)
+			continue;
+
 		if (rxq->wq) {
 			ret = ibv_destroy_wq(rxq->wq);
 			if (ret)
@@ -210,14 +209,14 @@ mana_stop_rx_queues(struct rte_eth_dev *dev)
 				DRV_LOG(ERR,
 					"rx_queue destroy_cq failed %d", ret);
 			rxq->cq = NULL;
+		}
 
-			if (rxq->channel) {
-				ret = ibv_destroy_comp_channel(rxq->channel);
-				if (ret)
-					DRV_LOG(ERR, "failed destroy comp %d",
-						ret);
-				rxq->channel = NULL;
-			}
+		if (rxq->channel) {
+			ret = ibv_destroy_comp_channel(rxq->channel);
+			if (ret)
+				DRV_LOG(ERR, "failed destroy comp %d",
+					ret);
+			rxq->channel = NULL;
 		}
 
 		/* Drain and free posted WQEs */

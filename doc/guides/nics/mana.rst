@@ -82,7 +82,10 @@ via ``IBV_EVENT_DEVICE_FATAL``.
 The driver handles this transparently through a two-phase reset flow:
 
 Enter phase
-   The interrupt handler blocks new data path bursts
+   Each MANA vport receives a device fatal notification through its own
+   verbs context and asynchronous event file descriptor.
+   The interrupt handler initiates recovery only for the notified vport,
+   blocks new data path bursts,
    and waits for all in-flight burst calls to drain
    using per-queue atomic flags,
    then spawns a control thread for the remaining work.
@@ -90,10 +93,22 @@ Enter phase
 Teardown and exit phase
    The control thread tears down IB resources and queues,
    unmaps secondary process doorbell pages, and closes the device.
-   After a delay for hardware recovery, it re-probes the PCI device.
+   Each control thread re-probes its vport by matching its PCI address
+   and MAC address after a delay for hardware recovery.
+   Recovery assumes that the MAC uniquely identifies the vport among
+   eligible ports on the PCI device and remains unchanged across reset.
+   This avoids replacing a sibling's protection domain while its TX queues
+   still own the vport, which would make further queue-pair creation fail
+   with ``EBUSY``.
    If the device is still unavailable, it waits 15 seconds and retries
    until the device returns, reinstalls the interrupt handler,
    reinitializes resources, and restarts queues.
+   Queues are restarted only if the vport's current ethdev started state
+   is set at the restart decision.
+   Secondary-process doorbell mappings are removed and restored
+   separately for each affected vport.
+   Synchronous control requests are serialized within each process.
+   If recovery fails, packet bursts remain blocked.
 
 The driver emits the following ethdev recovery events
 to notify upper layers (e.g. netvsc) of the reset lifecycle:

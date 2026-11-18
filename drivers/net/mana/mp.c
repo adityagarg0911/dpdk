@@ -2,6 +2,7 @@
  * Copyright 2022 Microsoft Corporation
  */
 
+#include <pthread.h>
 #include <sys/mman.h>
 #include <rte_malloc.h>
 #include <ethdev_driver.h>
@@ -15,6 +16,21 @@
 #include "mana.h"
 
 extern struct mana_shared_data *mana_shared_data;
+
+/* EAL permits only one pending request per action name and peer. */
+static pthread_mutex_t mana_mp_request_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static int
+mana_mp_request_sync(struct rte_mp_msg *req, struct rte_mp_reply *reply,
+		     const struct timespec *ts)
+{
+	int ret;
+
+	pthread_mutex_lock(&mana_mp_request_lock);
+	ret = rte_mp_request_sync(req, reply, ts);
+	pthread_mutex_unlock(&mana_mp_request_lock);
+	return ret;
+}
 
 /*
  * Process MR request from secondary process.
@@ -291,7 +307,7 @@ mana_mp_req_verbs_cmd_fd(struct rte_eth_dev *dev)
 
 	mp_init_msg(&mp_req, MANA_MP_REQ_VERBS_CMD_FD, dev->data->port_id);
 
-	ret = rte_mp_request_sync(&mp_req, &mp_rep, &ts);
+	ret = mana_mp_request_sync(&mp_req, &mp_rep, &ts);
 	if (ret) {
 		DRV_LOG(ERR, "port %u request to primary process failed",
 			dev->data->port_id);
@@ -345,7 +361,7 @@ mana_mp_req_mr_create(struct mana_priv *priv, uintptr_t addr, uint64_t len)
 	req->addr = addr;
 	req->len = len;
 
-	ret = rte_mp_request_sync(&mp_req, &mp_rep, &ts);
+	ret = mana_mp_request_sync(&mp_req, &mp_rep, &ts);
 	if (ret) {
 		DRV_LOG(ERR, "Port %u request to primary failed",
 			req->port_id);
@@ -394,7 +410,7 @@ mana_mp_req_on_rxtx(struct rte_eth_dev *dev, enum mana_mp_req_type type)
 		mp_req.fds[0] = priv->ib_ctx->cmd_fd;
 	}
 
-	ret = rte_mp_request_sync(&mp_req, &mp_rep, &ts);
+	ret = mana_mp_request_sync(&mp_req, &mp_rep, &ts);
 	if (ret) {
 		if (rte_errno != ENOTSUP)
 			DRV_LOG(ERR, "port %u failed to request Rx/Tx (%d)",

@@ -121,6 +121,9 @@ rx_intr_vec_disable(struct mana_priv *priv)
 {
 	struct rte_intr_handle *intr_handle = priv->intr_handle;
 
+	if (intr_handle == NULL)
+		return;
+
 	rte_intr_free_epoll_fd(intr_handle);
 	rte_intr_vec_list_free(intr_handle);
 	rte_intr_nb_efd_set(intr_handle, 0);
@@ -189,12 +192,15 @@ mana_dev_start(struct rte_eth_dev *dev)
 	int ret;
 	struct mana_priv *priv = dev->data->dev_private;
 
-	rte_spinlock_init(&priv->mr_btree_lock);
-	ret = mana_mr_btree_init(&priv->mr_btree, MANA_MR_BTREE_CACHE_N,
-				 dev->device->numa_node);
-	if (ret) {
-		DRV_LOG(ERR, "Failed to init device MR btree %d", ret);
-		return ret;
+	/* MRs remain cached by the queues across port stop/start. */
+	if (priv->mr_btree.table == NULL) {
+		rte_spinlock_init(&priv->mr_btree_lock);
+		ret = mana_mr_btree_init(&priv->mr_btree, MANA_MR_BTREE_CACHE_N,
+					 dev->device->numa_node);
+		if (ret) {
+			DRV_LOG(ERR, "Failed to init device MR btree %d", ret);
+			return ret;
+		}
 	}
 
 	ret = mana_start_tx_queues(dev);
@@ -234,8 +240,6 @@ failed_rx:
 	mana_stop_tx_queues(dev);
 
 failed_tx:
-	mana_mr_btree_free(&priv->mr_btree);
-
 	return ret;
 }
 
@@ -288,6 +292,7 @@ mana_dev_close(struct rte_eth_dev *dev)
 
 	DRV_LOG(DEBUG, "Free MR for priv %p", priv);
 	mana_remove_all_mr(priv);
+	mana_mr_btree_free(&priv->mr_btree);
 
 	state = rte_atomic_load_explicit(&priv->dev_state,
 					 rte_memory_order_acquire);
@@ -1389,8 +1394,8 @@ mana_ibv_device_to_pci_addr(const struct ibv_device *device,
 	return 0;
 }
 
-static int mana_pci_probe(struct rte_pci_driver *pci_drv,
-			  struct rte_pci_device *pci_dev);
+static int mana_pci_probe_mac(struct rte_pci_device *pci_dev,
+			     struct rte_ether_addr *mac_addr);
 static void mana_intr_handler(void *arg);
 static void mana_reset_exit(struct mana_priv *priv);
 
@@ -1501,6 +1506,11 @@ mana_reset_thread(void *arg)
 
 	pthread_mutex_lock(&priv->reset_ops_lock);
 
+	if (rte_atomic_load_explicit(&priv->dev_state,
+			rte_memory_order_acquire) != MANA_DEV_RESET_ENTER) {
+		pthread_mutex_unlock(&priv->reset_ops_lock);
+		return 0;
+	}
 	/* Teardown: stop data path, unmap secondary doorbells, close device,
 	 * free MR caches. Must happen immediately — hardware may be gone.
 	 */
@@ -1533,16 +1543,22 @@ mana_reset_thread(void *arg)
 		struct mana_rxq *rxq = dev->data->rx_queues[i];
 		struct mana_txq *txq = dev->data->tx_queues[i];
 
-		DRV_LOG(DEBUG, "Free MR for priv = %p, rxq %u, txq %u",
-			priv, rxq->rxq_idx, txq->txq_idx);
-		mana_mr_btree_free(&rxq->mr_btree);
-		mana_mr_btree_free(&txq->mr_btree);
+		if (rxq != NULL)
+			mana_mr_btree_free(&rxq->mr_btree);
+		if (txq != NULL)
+			mana_mr_btree_free(&txq->mr_btree);
 	}
 
 	DRV_LOG(DEBUG, "Teardown complete");
 
-	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_EXIT,
-				     rte_memory_order_release);
+	/* Do not overwrite a stop/close or PCI removal notification. */
+	{
+		enum mana_device_state expected = MANA_DEV_RESET_ENTER;
+
+		rte_atomic_compare_exchange_strong_explicit(&priv->dev_state,
+			&expected, MANA_DEV_RESET_EXIT,
+			rte_memory_order_acq_rel, rte_memory_order_acquire);
+	}
 
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 
@@ -1559,7 +1575,7 @@ mana_reset_thread(void *arg)
 	return 0;
 
 reset_failed:
-	mana_clear_burst_state(dev);
+	/* Keep bursts blocked: queues may already have been destroyed. */
 	pthread_mutex_unlock(&priv->reset_ops_lock);
 
 	DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
@@ -1569,7 +1585,7 @@ reset_failed:
 	return 0;
 }
 
-static void
+static int
 mana_reset_enter(struct mana_priv *priv)
 {
 	int ret;
@@ -1654,17 +1670,16 @@ mana_reset_enter(struct mana_priv *priv)
 	DRV_LOG(DEBUG, "Reset thread started");
 
 	pthread_mutex_unlock(&priv->reset_ops_lock);
-	return;
+	return 0;
 
 reset_failed:
-	mana_clear_burst_state(dev);
 	pthread_mutex_unlock(&priv->reset_ops_lock);
+	return ret;
 }
 
 static int
-mana_reset_exit_delay(void *arg)
+mana_reset_exit_delay(struct mana_priv *priv)
 {
-	struct mana_priv *priv = (struct mana_priv *)arg;
 	int ret = 0;
 	int i;
 	struct rte_eth_dev *dev;
@@ -1697,7 +1712,11 @@ mana_reset_exit_delay(void *arg)
 	priv->ib_ctx = NULL;
 
 retry_probe:
-	ret = mana_pci_probe(NULL, pci_dev);
+	ret = mana_pci_probe_mac(pci_dev, dev->data->mac_addrs);
+	if (ret > 0)
+		ret = 0;
+	else if (ret == 0)
+		ret = -ENODEV;
 	if (ret == -ENODEV) {
 		DRV_LOG(WARNING,
 			"MANA device not ready after reset, retrying in %us",
@@ -1721,22 +1740,26 @@ retry_probe:
 		struct mana_rxq *rxq = dev->data->rx_queues[i];
 		struct mana_txq *txq = dev->data->tx_queues[i];
 
-		ret = mana_mr_btree_init(&rxq->mr_btree,
-					 MANA_MR_BTREE_PER_QUEUE_N,
-					 rxq->socket);
-		if (ret) {
-			DRV_LOG(ERR, "Failed to init RXQ %d MR btree "
-				"on socket %u, ret %d", i, rxq->socket, ret);
-			goto mr_init_failed_rxq;
+		if (rxq != NULL) {
+			ret = mana_mr_btree_init(&rxq->mr_btree,
+						 MANA_MR_BTREE_PER_QUEUE_N,
+						 rxq->socket);
+			if (ret) {
+				DRV_LOG(ERR, "Failed to init RXQ %d MR btree "
+					"on socket %u, ret %d", i, rxq->socket, ret);
+				goto mr_init_failed_rxq;
+			}
 		}
 
-		ret = mana_mr_btree_init(&txq->mr_btree,
-					 MANA_MR_BTREE_PER_QUEUE_N,
-					 txq->socket);
-		if (ret) {
-			DRV_LOG(ERR, "Failed to init TXQ %d MR btree "
-				"on socket %u, ret %d", i, txq->socket, ret);
-			goto mr_init_failed_txq;
+		if (txq != NULL) {
+			ret = mana_mr_btree_init(&txq->mr_btree,
+						 MANA_MR_BTREE_PER_QUEUE_N,
+						 txq->socket);
+			if (ret) {
+				DRV_LOG(ERR, "Failed to init TXQ %d MR btree "
+					"on socket %u, ret %d", i, txq->socket, ret);
+				goto mr_init_failed_txq;
+			}
 		}
 	}
 	DRV_LOG(DEBUG, "priv %p, num_queues %u", priv, priv->num_queues);
@@ -1749,10 +1772,12 @@ retry_probe:
 		goto mr_init_failed_all;
 	}
 
-	ret = mana_dev_start(dev);
-	if (ret) {
-		DRV_LOG(ERR, "Failed to start mana dev ret %d", ret);
-		goto mr_init_failed_all;
+	if (dev->data->dev_started) {
+		ret = mana_dev_start(dev);
+		if (ret) {
+			DRV_LOG(ERR, "Failed to start mana dev ret %d", ret);
+			goto mr_init_failed_all;
+		}
 	}
 
 	/* Clear per-queue burst_state before marking device active so
@@ -1782,8 +1807,9 @@ mr_init_failed_all:
 
 mr_init_failed_txq:
 	/* RXQ btree at index i was initialized, free it */
-	mana_mr_btree_free(&((struct mana_rxq *)
-			     dev->data->rx_queues[i])->mr_btree);
+	if (dev->data->rx_queues[i] != NULL)
+		mana_mr_btree_free(&((struct mana_rxq *)
+				     dev->data->rx_queues[i])->mr_btree);
 
 mr_init_failed_rxq:
 	/* Free all fully initialized btrees for indices < i */
@@ -1791,8 +1817,10 @@ mr_init_failed_rxq:
 		struct mana_rxq *rxq = dev->data->rx_queues[j];
 		struct mana_txq *txq = dev->data->tx_queues[j];
 
-		mana_mr_btree_free(&rxq->mr_btree);
-		mana_mr_btree_free(&txq->mr_btree);
+		if (rxq != NULL)
+			mana_mr_btree_free(&rxq->mr_btree);
+		if (txq != NULL)
+			mana_mr_btree_free(&txq->mr_btree);
 	}
 	rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
 				     rte_memory_order_release);
@@ -1827,24 +1855,26 @@ mana_reset_exit(struct mana_priv *priv)
 
 	rxq_intr_disable(priv);
 
-	/* Unregister the interrupt handler. Since mana_reset_exit is always
-	 * called from mana_reset_thread (a non-interrupt thread), the
-	 * interrupt source is inactive and rte_intr_callback_unregister
-	 * succeeds directly.
-	 */
+	/* Do not free a handle or close its context while a callback is active. */
 	if (priv->intr_handle) {
 		ret = rte_intr_callback_unregister(priv->intr_handle,
 						   mana_intr_handler, priv);
-		if (ret < 0)
+		if (ret < 0 && ret != -ENOENT) {
 			DRV_LOG(ERR, "Failed to unregister intr callback ret %d",
 				ret);
-		else
-			DRV_LOG(DEBUG, "%d intr callback(s) removed", ret);
+			rte_atomic_store_explicit(&priv->dev_state, MANA_DEV_RESET_FAILED,
+						 rte_memory_order_release);
+			pthread_mutex_unlock(&priv->reset_ops_lock);
+			rte_eth_dev_callback_process(&rte_eth_devices[priv->port_id],
+						    RTE_ETH_EVENT_RECOVERY_FAILED, NULL);
+			return;
+		}
 
 		/* fd is owned by ibverbs, only clear reference here. */
 		rte_intr_fd_set(priv->intr_handle, -1);
 		rte_intr_instance_free(priv->intr_handle);
 		priv->intr_handle = NULL;
+		rte_eth_devices[priv->port_id].intr_handle = NULL;
 	}
 
 	/* Proceed directly to reset exit delay (re-probe and restart).
@@ -1864,7 +1894,8 @@ mana_intr_handler(void *arg)
 	struct mana_priv *priv = arg;
 	struct ibv_context *ctx = priv->ib_ctx;
 	struct ibv_async_event event = { 0 };
-	struct rte_eth_dev *dev;
+	struct rte_eth_dev *dev = &rte_eth_devices[priv->port_id];
+	int ret;
 
 	/* Read and ack all messages from IB device */
 	while (true) {
@@ -1878,45 +1909,26 @@ mana_intr_handler(void *arg)
 				rte_memory_order_acquire));
 			if (rte_atomic_load_explicit(&priv->dev_state,
 			    rte_memory_order_acquire) == MANA_DEV_ACTIVE) {
-				/* Notify upper layers (e.g. netvsc) before
-				 * acquiring the lock so they can switch data
-				 * path before mana stops queues. Emitting
-				 * outside the lock avoids deadlock if the
-				 * callback calls dev_stop/dev_close.
-				 */
-				dev = &rte_eth_devices[priv->port_id];
-				DRV_LOG(INFO,
-					"Sending RTE_ETH_EVENT_ERR_RECOVERING for port %u",
+				/* Callbacks may stop the port, so notify before taking its lock. */
+				DRV_LOG(INFO, "Sending RTE_ETH_EVENT_ERR_RECOVERING for port %u",
 					priv->port_id);
 				rte_eth_dev_callback_process(dev,
-					RTE_ETH_EVENT_ERR_RECOVERING,
-					NULL);
+					RTE_ETH_EVENT_ERR_RECOVERING, NULL);
 
 				pthread_mutex_lock(&priv->reset_ops_lock);
-
-				/* Re-check after lock to avoid racing with
-				 * mana_pci_remove_event_cb which may have
-				 * set RESET_FAILED while we waited.
-				 */
-				if (rte_atomic_load_explicit(&priv->dev_state,
-				    rte_memory_order_acquire) !=
-				    MANA_DEV_ACTIVE) {
-					pthread_mutex_unlock(
-						&priv->reset_ops_lock);
+				if (priv->ib_ctx == NULL ||
+				    rte_atomic_load_explicit(&priv->dev_state,
+					rte_memory_order_acquire) != MANA_DEV_ACTIVE) {
+					pthread_mutex_unlock(&priv->reset_ops_lock);
 					break;
 				}
 
-				mana_reset_enter(priv);
-
-				if (rte_atomic_load_explicit(&priv->dev_state,
-				    rte_memory_order_acquire) ==
-				    MANA_DEV_RESET_FAILED) {
-					DRV_LOG(INFO,
-						"Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
+				ret = mana_reset_enter(priv);
+				if (ret != 0) {
+					DRV_LOG(INFO, "Sending RTE_ETH_EVENT_RECOVERY_FAILED for port %u",
 						priv->port_id);
 					rte_eth_dev_callback_process(dev,
-						RTE_ETH_EVENT_RECOVERY_FAILED,
-						NULL);
+						RTE_ETH_EVENT_RECOVERY_FAILED, NULL);
 				}
 			} else {
 				DRV_LOG(ERR, "Already in reset handling, dev_state=%d",
@@ -1939,9 +1951,6 @@ mana_intr_uninstall(struct mana_priv *priv)
 	int ret;
 	struct rte_eth_dev *dev;
 
-	if (!priv->intr_handle)
-		return 0;
-
 	/* Unregister PCI device removal event callback.
 	 * Do not retry on -EAGAIN to avoid deadlock: the callback
 	 * may be blocked waiting for reset_ops_lock which we hold.
@@ -1955,9 +1964,12 @@ mana_intr_uninstall(struct mana_priv *priv)
 				ret);
 	}
 
+	if (priv->intr_handle == NULL)
+		return 0;
+
 	ret = rte_intr_callback_unregister(priv->intr_handle,
 					   mana_intr_handler, priv);
-	if (ret <= 0) {
+	if (ret < 0 && ret != -ENOENT) {
 		DRV_LOG(ERR, "Failed to unregister intr callback ret %d", ret);
 		return ret;
 	}
@@ -2017,16 +2029,6 @@ mana_intr_install(struct rte_eth_dev *eth_dev, struct mana_priv *priv)
 		rte_intr_fd_set(priv->intr_handle, -1);
 		goto free_intr;
 	}
-
-	/* Register for PCI device removal events to distinguish
-	 * PCI hot-remove from service reset. This requires the
-	 * application to call rte_dev_event_monitor_start() for
-	 * events to be delivered (e.g. testpmd --hot-plug-handling).
-	 */
-	ret = rte_dev_event_callback_register(eth_dev->device->name,
-					      mana_pci_remove_event_cb, priv);
-	if (ret)
-		DRV_LOG(WARNING, "Failed to register PCI remove event callback");
 
 	eth_dev->intr_handle = priv->intr_handle;
 	return 0;
@@ -2179,10 +2181,7 @@ mana_init_once(void)
 
 /*
  * Probe an IB port
- * Return value:
- * positive value: successfully probed port
- * 0: port not matching specified MAC address
- * negative value: error code
+ * Return zero on success or a negative error code.
  */
 static int
 mana_probe_port(struct ibv_device *ibdev, struct ibv_device_attr_ex *dev_attr,
@@ -2209,6 +2208,10 @@ mana_probe_port(struct ibv_device *ibdev, struct ibv_device_attr_ex *dev_attr,
 	if (eth_dev) {
 		is_reset = true;
 		priv = eth_dev->data->dev_private;
+		if (rte_eal_process_type() == RTE_PROC_PRIMARY && priv->ib_ctx != NULL) {
+			DRV_LOG(ERR, "Cannot re-probe live port %s", name);
+			return -EBUSY;
+		}
 		DRV_LOG(DEBUG, "Device reset for eth_dev %p priv %p",
 			eth_dev, priv);
 	} else {
@@ -2264,15 +2267,15 @@ mana_probe_port(struct ibv_device *ibdev, struct ibv_device_attr_ex *dev_attr,
 
 	ctx = ibv_open_device(ibdev);
 	if (!ctx) {
+		ret = -errno;
 		DRV_LOG(ERR, "Failed to open IB device %s", ibdev->name);
-		ret = -ENODEV;
 		goto failed;
 	}
 
 	priv->ib_pd = ibv_alloc_pd(ctx);
 	if (!priv->ib_pd) {
+		ret = -errno;
 		DRV_LOG(ERR, "ibv_alloc_pd failed port %d", port);
-		ret = -ENOMEM;
 		goto failed;
 	}
 
@@ -2282,8 +2285,8 @@ mana_probe_port(struct ibv_device *ibdev, struct ibv_device_attr_ex *dev_attr,
 	attr.pd_context = (void *)(uintptr_t)port;
 	priv->ib_parent_pd = ibv_alloc_parent_domain(ctx, &attr);
 	if (!priv->ib_parent_pd) {
+		ret = -errno;
 		DRV_LOG(ERR, "ibv_alloc_parent_domain failed port %d", port);
-		ret = -ENOMEM;
 		goto failed;
 	}
 
@@ -2375,8 +2378,15 @@ out:
 	DRV_LOG(INFO, "device %s priv %p dev port %d at port %u",
 		name, priv, priv->dev_port, eth_dev->data->port_id);
 
-	if (!is_reset)
+	if (!is_reset) {
+		/* The PCI callback persists when the verbs context is replaced. */
+		ret = rte_dev_event_callback_register(eth_dev->device->name,
+						      mana_pci_remove_event_cb, priv);
+		if (ret != 0)
+			DRV_LOG(WARNING, "Failed to register PCI remove event callback: %d",
+				ret);
 		rte_eth_dev_probing_finish(eth_dev);
+	}
 
 	return 0;
 
@@ -2413,7 +2423,8 @@ failed:
 /*
  * Goes through the IB device list to look for the IB port matching the
  * mac_addr. If found, create a rte_eth_dev for it.
- * Return value: number of successfully probed devices
+ * Return the number of successfully probed ports, or the first probe
+ * error if none succeeded. Return zero if no ports matched.
  */
 static int
 mana_pci_probe_mac(struct rte_pci_device *pci_dev,
@@ -2426,8 +2437,14 @@ mana_pci_probe_mac(struct rte_pci_device *pci_dev,
 	int ret;
 	uint8_t port;
 	int count = 0;
+	int first_error = 0;
 
 	ibv_list = ibv_get_device_list(&num_devices);
+	if (ibv_list == NULL) {
+		ret = -errno;
+		DRV_LOG(ERR, "Failed to get IB device list: %d", ret);
+		return ret;
+	}
 	for (ibv_idx = 0; ibv_idx < num_devices; ibv_idx++) {
 		struct ibv_device *ibdev = ibv_list[ibv_idx];
 		struct rte_pci_addr pci_addr;
@@ -2445,6 +2462,9 @@ mana_pci_probe_mac(struct rte_pci_device *pci_dev,
 
 		ctx = ibv_open_device(ibdev);
 		if (!ctx) {
+			ret = -errno;
+			if (first_error == 0)
+				first_error = ret;
 			DRV_LOG(ERR, "Failed to open IB device %s",
 				ibdev->name);
 			continue;
@@ -2453,6 +2473,8 @@ mana_pci_probe_mac(struct rte_pci_device *pci_dev,
 		ibv_close_device(ctx);
 
 		if (ret) {
+			if (first_error == 0)
+				first_error = -ret;
 			DRV_LOG(ERR, "Failed to query IB device %s",
 				ibdev->name);
 			continue;
@@ -2485,6 +2507,8 @@ mana_pci_probe_mac(struct rte_pci_device *pci_dev,
 			ret = mana_probe_port(ibdev, &dev_attr, port, pci_dev, &addr);
 			if (ret) {
 				DRV_LOG(ERR, "Probe on IB port %u failed %d", port, ret);
+				if (first_error == 0)
+					first_error = ret;
 			} else {
 				count++;
 				DRV_LOG(INFO, "Successfully probed on IB port %u", port);
@@ -2493,7 +2517,7 @@ mana_pci_probe_mac(struct rte_pci_device *pci_dev,
 	}
 
 	ibv_free_device_list(ibv_list);
-	return count;
+	return count > 0 ? count : first_error;
 }
 
 /*
@@ -2526,11 +2550,21 @@ mana_pci_probe(struct rte_pci_driver *pci_drv __rte_unused,
 
 	/* If there are no driver parameters, probe on all ports */
 	if (conf.index) {
-		for (i = 0; i < conf.index; i++)
-			count += mana_pci_probe_mac(pci_dev,
-						    &conf.mac_array[i]);
+		for (i = 0; i < conf.index; i++) {
+			ret = mana_pci_probe_mac(pci_dev, &conf.mac_array[i]);
+			if (ret < 0) {
+				DRV_LOG(ERR, "Probe for MAC filter %u failed %d", i, ret);
+				continue;
+			}
+			count += ret;
+		}
 	} else {
-		count = mana_pci_probe_mac(pci_dev, NULL);
+		ret = mana_pci_probe_mac(pci_dev, NULL);
+		if (ret < 0)
+			DRV_LOG(ERR, "Probe on PCI device %s failed %d",
+				pci_dev->device.name, ret);
+		else
+			count = ret;
 	}
 
 	/* If no device is found, clean up resources if this is the last one */
