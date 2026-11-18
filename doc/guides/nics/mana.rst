@@ -122,6 +122,37 @@ to notify upper layers (e.g. netvsc) of the reset lifecycle:
 ``RTE_ETH_EVENT_RECOVERY_FAILED``
    Recovery failed.
 
+Recovery diagnostics
+~~~~~~~~~~~~~~~~~~~~
+
+MANA log messages contain the common prefix ``MANA_DIAG``.
+Enable informational driver messages and timestamps in every primary and
+secondary process by adding these EAL arguments before the application's ``--``::
+
+   --log-level=pmd.net.mana.driver:info --log-timestamp=iso
+
+Recovery stage records identify the process ID, process role, device name,
+ethdev port number, verbs port number, MAC address, device state and return value.
+Device state values are 0 (active), 1 (reset enter), 2 (reset exit) and
+3 (reset failed).
+Probe records include the target MAC, enumerated device count,
+candidate port identities, attempt number and retry delay.
+Failed verbs opens and protection-domain allocations report the captured
+``errno``; verbs queries report their returned error number.
+IPC records include request type, reply counts and secondary remap results.
+Return values retain the underlying API's convention, so a positive probe
+result is a count of matched ports, not an error.
+
+Collect both standard output and standard error from each process.
+Filter the saved logs with ``grep MANA_DIAG``.
+For each recovering port, follow ``reset-enter``, ``teardown-complete``,
+``probe-result``, ``secondary-reset-exit`` and ``recovery-success``.
+``queues-restarted`` indicates that queue restart returned successfully;
+``queues-left-stopped`` indicates that the application left the port stopped.
+``mp-skip`` means no secondary was registered at the request decision.
+These records confirm control-path progress, not successful packet delivery.
+Verify that packet counters resume on every intended port as well.
+
 To distinguish a PCI hot-remove from a service reset,
 the driver registers for PCI device removal events.
 This requires the application to call ``rte_dev_event_monitor_start()``

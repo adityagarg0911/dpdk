@@ -524,13 +524,13 @@ extern int mana_logtype_init;
 #define RTE_LOGTYPE_MANA_INIT mana_logtype_init
 
 #define DRV_LOG(level, ...) \
-	RTE_LOG_LINE_PREFIX(level, MANA_DRIVER, "%s(): ", __func__, __VA_ARGS__)
+	RTE_LOG_LINE_PREFIX(level, MANA_DRIVER, "MANA_DIAG %s(): ", __func__, __VA_ARGS__)
 
 #define DP_LOG(level, ...) \
-	RTE_LOG_DP_LINE(level, MANA_DRIVER, __VA_ARGS__)
+	RTE_LOG_DP_LINE(level, MANA_DRIVER, "MANA_DIAG " __VA_ARGS__)
 
 #define PMD_INIT_LOG(level, ...) \
-	RTE_LOG_LINE_PREFIX(level, MANA_INIT, "%s(): ", __func__, __VA_ARGS__)
+	RTE_LOG_LINE_PREFIX(level, MANA_INIT, "MANA_DIAG %s(): ", __func__, __VA_ARGS__)
 
 #define PMD_INIT_FUNC_TRACE() PMD_INIT_LOG(DEBUG, " >>")
 

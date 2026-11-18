@@ -151,7 +151,8 @@ mana_mp_reset_enter(struct rte_eth_dev *dev)
 	if (addr)
 		(void)munmap(addr, rte_mem_page_size());
 
-	DRV_LOG(DEBUG, "Secondary doorbell pages unmapped");
+	DRV_LOG(INFO, "stage=secondary-unmap pid=%d port=%u mapped_before=%u",
+		(int)getpid(), dev->data->port_id, addr != NULL);
 	return 0;
 }
 
@@ -172,6 +173,8 @@ mana_mp_secondary_handle(const struct rte_mp_msg *mp_msg, const void *peer)
 
 	dev = &rte_eth_devices[param->port_id];
 
+	DRV_LOG(INFO, "stage=secondary-request pid=%d port=%u type=%u fds=%d",
+		(int)getpid(), param->port_id, param->type, mp_msg->num_fds);
 	mp_init_msg(&mp_res, param->type, param->port_id);
 
 	switch (param->type) {
@@ -249,6 +252,9 @@ mana_mp_secondary_handle(const struct rte_mp_msg *mp_msg, const void *peer)
 			 */
 			if (mp_msg->num_fds >= 1)
 				close(mp_msg->fds[0]);
+			DRV_LOG(INFO, "stage=secondary-remap pid=%d port=%u ret=%d mapped=%u",
+				(int)getpid(), param->port_id, res->result,
+				proc_priv->db_page != NULL);
 		}
 		ret = rte_mp_reply(&mp_res, peer);
 		break;
@@ -397,9 +403,15 @@ mana_mp_req_on_rxtx(struct rte_eth_dev *dev, enum mana_mp_req_type type)
 		return -EINVAL;
 	}
 
-	if (rte_atomic_load_explicit(&mana_shared_data->secondary_cnt, rte_memory_order_relaxed) == 0)
+	if (rte_atomic_load_explicit(&mana_shared_data->secondary_cnt,
+				    rte_memory_order_relaxed) == 0) {
+		DRV_LOG(INFO, "stage=mp-skip pid=%d port=%u type=%u secondaries=0",
+			(int)getpid(), dev->data->port_id, type);
 		return 0;
+	}
 
+	DRV_LOG(INFO, "stage=mp-request pid=%d port=%u type=%u",
+		(int)getpid(), dev->data->port_id, type);
 	mp_init_msg(&mp_req, type, dev->data->port_id);
 
 	/* Include IB cmd FD for secondary doorbell remap */
@@ -413,8 +425,8 @@ mana_mp_req_on_rxtx(struct rte_eth_dev *dev, enum mana_mp_req_type type)
 	ret = mana_mp_request_sync(&mp_req, &mp_rep, &ts);
 	if (ret) {
 		if (rte_errno != ENOTSUP)
-			DRV_LOG(ERR, "port %u failed to request Rx/Tx (%d)",
-				dev->data->port_id, type);
+			DRV_LOG(ERR, "stage=mp-request-failed port=%u type=%u ret=%d rte_errno=%d",
+				dev->data->port_id, type, ret, rte_errno);
 		goto exit;
 	}
 	if (mp_rep.nb_sent != mp_rep.nb_received) {
@@ -426,6 +438,8 @@ mana_mp_req_on_rxtx(struct rte_eth_dev *dev, enum mana_mp_req_type type)
 	for (i = 0; i < mp_rep.nb_received; i++) {
 		mp_res = &mp_rep.msgs[i];
 		res = (struct mana_mp_param *)mp_res->param;
+		DRV_LOG(INFO, "stage=mp-reply port=%u type=%u peer=%d ret=%d",
+			dev->data->port_id, type, i, res->result);
 		if (res->result) {
 			DRV_LOG(ERR, "port %u request failed on secondary %d",
 				dev->data->port_id, i);
@@ -434,6 +448,8 @@ mana_mp_req_on_rxtx(struct rte_eth_dev *dev, enum mana_mp_req_type type)
 		}
 	}
 exit:
+	DRV_LOG(INFO, "stage=mp-complete pid=%d port=%u type=%u sent=%d received=%d ret=%d",
+		(int)getpid(), dev->data->port_id, type, mp_rep.nb_sent, mp_rep.nb_received, ret);
 	free(mp_rep.msgs);
 	return ret;
 }
